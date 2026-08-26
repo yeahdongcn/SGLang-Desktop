@@ -17,8 +17,7 @@ public actor ModelLibrary {
         var records = try await store.load()
         records.removeAll {
             $0.id == model.id
-                || ($0.repository == model.repository
-                    && (model.localDirectory == nil || $0.localDirectory == model.localDirectory))
+                || $0.repository == model.repository
         }
         records.append(model)
         try await store.save(records)

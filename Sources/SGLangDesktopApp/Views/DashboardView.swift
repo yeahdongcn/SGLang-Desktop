@@ -165,7 +165,7 @@ private struct EngineControlCard: View {
                 TextField("Port", text: $model.portText)
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 90)
-                if model.selectedInstallation?.manifest.engine == .sglangOmni {
+                if model.selectedInstallation != nil {
                     Toggle("Use MLX", isOn: $model.useMLX)
                         .toggleStyle(.checkbox)
                 }

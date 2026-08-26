@@ -259,7 +259,7 @@ final class DesktopViewModel: ObservableObject {
                 title: "Qwen3 0.6B · SGLang",
                 repository: "Qwen/Qwen3-0.6B",
                 engine: .sglang,
-                defaultMLX: false,
+                defaultMLX: true,
                 localPath: qwen?.localDirectory?.path
             ),
             ModelPreset(
@@ -314,18 +314,26 @@ final class DesktopViewModel: ObservableObject {
             "HF_HOME": paths.models.appending(path: "huggingface").path,
             "SGLANG_OMNI_STRICT_PORT": "1",
         ]
+        if useMLX {
+            environment["SGLANG_USE_MLX"] = "1"
+        }
+        let servedModelName =
+            modelPresets.first(where: { $0.displayPath == modelPath })?.repository
+            ?? URL(fileURLWithPath: modelPath).lastPathComponent
         if installation.manifest.engine == .sglangOmni {
             arguments += [
-                "--model-name", URL(fileURLWithPath: modelPath).lastPathComponent,
+                "--model-name", servedModelName,
                 "--asr.engine.max_running_requests", "1",
             ]
-            if useMLX {
-                environment["SGLANG_USE_MLX"] = "1"
-            }
             let ffmpeg = "/opt/homebrew/opt/ffmpeg@7/lib"
             if FileManager.default.fileExists(atPath: ffmpeg) {
                 environment["DYLD_LIBRARY_PATH"] = ffmpeg
             }
+        } else {
+            arguments += [
+                "--model-type", "llm",
+                "--served-model-name", servedModelName,
+            ]
         }
 
         let configuration = EngineLaunchConfiguration(
@@ -344,20 +352,7 @@ final class DesktopViewModel: ObservableObject {
             monitorTask?.cancel()
             monitorTask = Task { [weak self] in
                 guard let self else { return }
-                let ready = await HealthProbe().waitUntilReady(
-                    url: configuration.healthURL,
-                    timeout: .seconds(600),
-                    interval: .milliseconds(500)
-                )
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    self.healthStatus =
-                        ready ? "Ready · http://127.0.0.1:\(port)" : "Startup timed out"
-                    self.processState =
-                        ready
-                        ? .running(processIdentifier: 0)
-                        : .failed(message: "Health check timed out")
-                }
+                await self.monitorEngine(configuration: configuration, port: port)
             }
         } catch {
             processState = .failed(message: error.localizedDescription)
@@ -405,6 +400,40 @@ final class DesktopViewModel: ObservableObject {
             if logEvents.count > 2_000 {
                 logEvents.removeFirst(logEvents.count - 2_000)
             }
+        }
+    }
+
+    private func monitorEngine(
+        configuration: EngineLaunchConfiguration,
+        port: UInt16
+    ) async {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(600))
+        var becameReady = false
+
+        while !Task.isCancelled {
+            let state = await supervisor.state()
+            processState = state
+            switch state {
+            case .failed(let message):
+                healthStatus = "Failed"
+                lastError = message
+                return
+            case .stopped:
+                healthStatus = becameReady ? "Stopped" : "Exited during startup"
+                return
+            case .starting, .running, .stopping:
+                break
+            }
+
+            if !becameReady, await HealthProbe().isReady(url: configuration.healthURL) {
+                becameReady = true
+                healthStatus = "Ready · http://127.0.0.1:\(port)"
+            } else if !becameReady, clock.now >= deadline {
+                healthStatus = "Startup timed out"
+                return
+            }
+            try? await clock.sleep(for: .milliseconds(500))
         }
     }
 

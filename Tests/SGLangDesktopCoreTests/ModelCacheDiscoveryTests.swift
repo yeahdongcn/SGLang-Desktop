@@ -32,6 +32,23 @@ import Testing
     #expect(discovered.isEmpty)
 }
 
+@Test func discoversModelScopeQwenCache() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "sglang-modelscope-cache-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let model = root.appending(path: ".cache/modelscope/hub/models/Qwen/Qwen3-0___6B")
+    try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+    try Data("weights".utf8).write(to: model.appending(path: "model.safetensors"))
+
+    let discovered = ModelCacheDiscovery().discover(homeDirectory: root)
+    let qwen = try #require(discovered.first(where: { $0.repository == "Qwen/Qwen3-0.6B" }))
+    #expect(
+        qwen.localDirectory?.resolvingSymlinksInPath()
+            == model.resolvingSymlinksInPath()
+    )
+    #expect(qwen.compatibleEngines == [.sglang])
+}
+
 @Test func discoversRuntimeExecutablesInAppleVenvLayout() throws {
     let root = FileManager.default.temporaryDirectory
         .appending(path: "sglang-runtime-discovery-\(UUID().uuidString)")

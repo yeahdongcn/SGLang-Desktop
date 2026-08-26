@@ -18,6 +18,12 @@ public struct ModelCacheDiscovery: Sendable {
 
         var results: [String: ManagedModel] = [:]
         for root in roots where FileManager.default.fileExists(atPath: root.path) {
+            if root.path.contains("modelscope") {
+                for model in discoverModelScopeModels(in: root) {
+                    results[model.repository.lowercased()] = model
+                }
+                continue
+            }
             guard
                 let children = try? FileManager.default.contentsOfDirectory(
                     at: root,
@@ -87,6 +93,50 @@ public struct ModelCacheDiscovery: Sendable {
                 || name.hasSuffix(".gguf")
                 || name.hasSuffix(".mlx")
         }
+    }
+
+    private func discoverModelScopeModels(in hubRoot: URL) -> [ManagedModel] {
+        let modelsRoot = hubRoot.appending(path: "models")
+        guard
+            let owners = try? FileManager.default.contentsOfDirectory(
+                at: modelsRoot,
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            )
+        else { return [] }
+
+        var models: [ManagedModel] = []
+        for owner in owners {
+            guard (try? owner.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true,
+                let repositories = try? FileManager.default.contentsOfDirectory(
+                    at: owner,
+                    includingPropertiesForKeys: [.isDirectoryKey],
+                    options: [.skipsHiddenFiles]
+                )
+            else { continue }
+            for repositoryDirectory in repositories {
+                guard hasModelWeights(repositoryDirectory) else { continue }
+                let modelName = repositoryDirectory.lastPathComponent.replacingOccurrences(
+                    of: "___",
+                    with: "."
+                )
+                let repository = "\(owner.lastPathComponent)/\(modelName)"
+                let engines: Set<EngineKind> =
+                    repository.lowercased().contains("asr")
+                    ? [.sglangOmni]
+                    : [.sglang]
+                models.append(
+                    ManagedModel(
+                        repository: repository,
+                        displayName: repository,
+                        localDirectory: repositoryDirectory,
+                        compatibleEngines: engines,
+                        state: .ready
+                    )
+                )
+            }
+        }
+        return models
     }
 
 }
