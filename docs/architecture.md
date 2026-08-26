@@ -43,9 +43,12 @@ The application target renders state and coordinates explicit user actions.
    that outlived its original UI process.
 7. Environment variables are constructed explicitly and do not inherit user
    Python, uv, or Homebrew configuration accidentally.
-8. The initial distribution ships outside the Mac App Store using Developer ID,
+8. Engine stdout and stderr are append-only files under `logs/`, so an engine
+   can keep writing safely after the UI exits and a relaunched UI can resume
+   tailing them.
+9. The initial distribution ships outside the Mac App Store using Developer ID,
    hardened runtime, and notarization.
-9. Pure-Python engine changes are delivered as overlays tied to a base lock;
+10. Pure-Python engine changes are delivered as overlays tied to a base lock;
    native/ABI changes create a new base generation.
 
 ## Why native Swift

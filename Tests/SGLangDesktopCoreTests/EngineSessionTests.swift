@@ -20,7 +20,9 @@ import Testing
         servedModelName: "qwen",
         usesMLX: true,
         port: 8000,
-        startedAt: Date(timeIntervalSince1970: 1_800_000_000)
+        startedAt: Date(timeIntervalSince1970: 1_800_000_000),
+        standardOutputLogURL: paths.logs.appending(path: "engine.stdout.log"),
+        standardErrorLogURL: paths.logs.appending(path: "engine.stderr.log")
     )
 
     try await store.upsert(session)
@@ -29,9 +31,31 @@ import Testing
     let encoded = try String(contentsOf: paths.sessionsFile, encoding: .utf8)
     #expect(!encoded.contains("arguments"))
     #expect(!encoded.contains("environment"))
+    #expect(encoded.contains("engine.stdout.log"))
 
     try await store.remove(processIdentifier: 42)
     #expect(try await store.sessions().isEmpty)
+}
+
+@Test func engineSessionDecodesLegacyRecordWithoutLogURLs() throws {
+    let session = EngineSession(
+        installationID: UUID(),
+        engine: .sglangOmni,
+        processIdentifier: 88,
+        processGroupIdentifier: 88,
+        runtimeExecutableURL: URL(fileURLWithPath: "/runtime/bin/sgl-omni"),
+        modelPath: "/models/asr",
+        port: 8_001
+    )
+    let data = try JSONEncoder().encode(session)
+    let text = try #require(String(data: data, encoding: .utf8))
+    #expect(!text.contains("standardOutputLogURL"))
+    #expect(!text.contains("standardErrorLogURL"))
+
+    let restored = try JSONDecoder().decode(EngineSession.self, from: data)
+    #expect(restored == session)
+    #expect(restored.standardOutputLogURL == nil)
+    #expect(restored.standardErrorLogURL == nil)
 }
 
 @Test func processInspectorRecognizesExecedManagedRuntimeWrapper() throws {

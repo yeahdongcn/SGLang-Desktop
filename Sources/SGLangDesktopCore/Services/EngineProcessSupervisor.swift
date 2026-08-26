@@ -30,6 +30,23 @@ public struct EngineLogEvent: Equatable, Sendable {
     }
 }
 
+/// Files backing a launched engine's standard streams. The child owns its
+/// inherited descriptors, so it can continue writing after the desktop app
+/// exits and closes its own copies.
+public struct EngineProcessLogURLs: Equatable, Sendable {
+    public let standardOutput: URL?
+    public let standardError: URL?
+
+    public init(standardOutput: URL? = nil, standardError: URL? = nil) {
+        self.standardOutput = standardOutput?.standardizedFileURL
+        self.standardError = standardError?.standardizedFileURL
+    }
+
+    public var isEmpty: Bool {
+        standardOutput == nil && standardError == nil
+    }
+}
+
 public actor EngineProcessSupervisor {
     private var process: Process?
     private var attachedSession: EngineSession?
@@ -37,11 +54,19 @@ public actor EngineProcessSupervisor {
     private var currentState: EngineProcessState = .stopped
     private var requestedStopProcessIdentifier: Int32?
     private let processInspector: ProcessInspector
+    private let logDirectory: URL?
+    private var activeLogURLs: EngineProcessLogURLs?
+    private var logTailTasks: [Task<Void, Never>] = []
+    private var logTailShutdownTask: Task<Void, Never>?
     private let logContinuation: AsyncStream<EngineLogEvent>.Continuation
     public nonisolated let logs: AsyncStream<EngineLogEvent>
 
-    public init(processInspector: ProcessInspector = ProcessInspector()) {
+    public init(
+        processInspector: ProcessInspector = ProcessInspector(),
+        logDirectory: URL? = nil
+    ) {
         self.processInspector = processInspector
+        self.logDirectory = logDirectory?.standardizedFileURL
         let pair = AsyncStream<EngineLogEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(2_000)
         )
@@ -51,6 +76,8 @@ public actor EngineProcessSupervisor {
 
     deinit {
         attachmentMonitorTask?.cancel()
+        logTailShutdownTask?.cancel()
+        for task in logTailTasks { task.cancel() }
         logContinuation.finish()
     }
 
@@ -75,6 +102,10 @@ public actor EngineProcessSupervisor {
         #endif
     }
 
+    public func currentLogURLs() -> EngineProcessLogURLs? {
+        activeLogURLs
+    }
+
     public func start(_ configuration: EngineLaunchConfiguration) throws {
         guard process == nil, attachedSession == nil else {
             throw EngineProcessError.alreadyRunning
@@ -90,32 +121,60 @@ public actor EngineProcessSupervisor {
         child.arguments = configuration.arguments
         child.environment = sanitizedEnvironment(configuration.environment)
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        child.standardOutput = stdoutPipe
-        child.standardError = stderrPipe
+        cancelLogTails()
+        activeLogURLs = nil
 
-        let continuation = logContinuation
-        stdoutPipe.fileHandleForReading.readabilityHandler = { handle in
-            while true {
-                let data = handle.availableData
-                guard !data.isEmpty else { break }
-                guard let message = String(data: data, encoding: .utf8) else { continue }
-                continuation.yield(EngineLogEvent(stream: .standardOutput, message: message))
+        var stdoutPipe: Pipe?
+        var stderrPipe: Pipe?
+        var parentWriteHandles: [FileHandle] = []
+        if let logDirectory {
+            let capture: DurableLogCapture
+            do {
+                capture = try makeDurableLogCapture(in: logDirectory)
+            } catch {
+                currentState = .failed(message: error.localizedDescription)
+                throw error
+            }
+            activeLogURLs = capture.urls
+            parentWriteHandles = [capture.standardOutput, capture.standardError]
+            child.standardOutput = capture.standardOutput
+            child.standardError = capture.standardError
+        } else {
+            let standardOutput = Pipe()
+            let standardError = Pipe()
+            stdoutPipe = standardOutput
+            stderrPipe = standardError
+            child.standardOutput = standardOutput
+            child.standardError = standardError
+
+            let continuation = logContinuation
+            standardOutput.fileHandleForReading.readabilityHandler = { handle in
+                while true {
+                    let data = handle.availableData
+                    guard !data.isEmpty else { break }
+                    guard let message = String(data: data, encoding: .utf8) else { continue }
+                    continuation.yield(
+                        EngineLogEvent(stream: .standardOutput, message: message)
+                    )
+                }
+            }
+            standardError.fileHandleForReading.readabilityHandler = { handle in
+                while true {
+                    let data = handle.availableData
+                    guard !data.isEmpty else { break }
+                    guard let message = String(data: data, encoding: .utf8) else { continue }
+                    continuation.yield(
+                        EngineLogEvent(stream: .standardError, message: message)
+                    )
+                }
             }
         }
-        stderrPipe.fileHandleForReading.readabilityHandler = { handle in
-            while true {
-                let data = handle.availableData
-                guard !data.isEmpty else { break }
-                guard let message = String(data: data, encoding: .utf8) else { continue }
-                continuation.yield(EngineLogEvent(stream: .standardError, message: message))
-            }
-        }
 
+        let terminationStandardOutputPipe = stdoutPipe
+        let terminationStandardErrorPipe = stderrPipe
         child.terminationHandler = { [weak self] terminated in
-            stdoutPipe.fileHandleForReading.readabilityHandler = nil
-            stderrPipe.fileHandleForReading.readabilityHandler = nil
+            terminationStandardOutputPipe?.fileHandleForReading.readabilityHandler = nil
+            terminationStandardErrorPipe?.fileHandleForReading.readabilityHandler = nil
             Task {
                 await self?.processDidTerminate(
                     processIdentifier: terminated.processIdentifier,
@@ -126,8 +185,14 @@ public actor EngineProcessSupervisor {
 
         do {
             try child.run()
+            // The child inherited independent descriptors during `run()`. The
+            // parent copies must not remain open for the lifetime of the UI.
+            for handle in parentWriteHandles { try? handle.close() }
             process = child
             currentState = .running(processIdentifier: child.processIdentifier)
+            if let activeLogURLs {
+                beginLogTails(urls: activeLogURLs, replayExisting: false)
+            }
             logContinuation.yield(
                 EngineLogEvent(
                     stream: .supervisor,
@@ -135,6 +200,10 @@ public actor EngineProcessSupervisor {
                 )
             )
         } catch {
+            for handle in parentWriteHandles { try? handle.close() }
+            stdoutPipe?.fileHandleForReading.readabilityHandler = nil
+            stderrPipe?.fileHandleForReading.readabilityHandler = nil
+            activeLogURLs = nil
             currentState = .failed(message: error.localizedDescription)
             throw error
         }
@@ -162,6 +231,14 @@ public actor EngineProcessSupervisor {
         attachedSession = session
         requestedStopProcessIdentifier = nil
         currentState = .running(processIdentifier: session.processIdentifier)
+        let restoredLogURLs = EngineProcessLogURLs(
+            standardOutput: validatedAttachedLogURL(session.standardOutputLogURL),
+            standardError: validatedAttachedLogURL(session.standardErrorLogURL)
+        )
+        activeLogURLs = restoredLogURLs.isEmpty ? nil : restoredLogURLs
+        if let activeLogURLs {
+            beginLogTails(urls: activeLogURLs, replayExisting: true)
+        }
         logContinuation.yield(
             EngineLogEvent(
                 stream: .supervisor,
@@ -177,6 +254,10 @@ public actor EngineProcessSupervisor {
         guard attachedSession != nil else { return }
         attachmentMonitorTask?.cancel()
         attachmentMonitorTask = nil
+        logTailShutdownTask?.cancel()
+        logTailShutdownTask = nil
+        cancelLogTails()
+        activeLogURLs = nil
         attachedSession = nil
         requestedStopProcessIdentifier = nil
         currentState = .stopped
@@ -249,6 +330,277 @@ public actor EngineProcessSupervisor {
             try? await Task.sleep(for: .seconds(45))
             await self?.escalateAttachedIfStillRunning(sessionID: session.id)
         }
+    }
+
+    private struct DurableLogCapture {
+        let urls: EngineProcessLogURLs
+        let standardOutput: FileHandle
+        let standardError: FileHandle
+    }
+
+    private func makeDurableLogCapture(in directory: URL) throws -> DurableLogCapture {
+        let fileManager = FileManager.default
+        try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+        #if canImport(Darwin)
+            var directoryInfo = stat()
+            guard
+                Darwin.lstat(directory.path, &directoryInfo) == 0,
+                directoryInfo.st_mode & S_IFMT == S_IFDIR
+            else {
+                throw EngineProcessError.insecureLogLocation(directory)
+            }
+        #endif
+        try fileManager.setAttributes(
+            [.posixPermissions: NSNumber(value: Int16(0o700))],
+            ofItemAtPath: directory.path
+        )
+
+        let identifier = "engine-\(UUID().uuidString.lowercased())"
+        let standardOutputURL = directory.appending(path: "\(identifier).stdout.log")
+        let standardErrorURL = directory.appending(path: "\(identifier).stderr.log")
+        let standardOutput = try Self.openAppendOnlyFile(at: standardOutputURL)
+        do {
+            let standardError = try Self.openAppendOnlyFile(at: standardErrorURL)
+            return DurableLogCapture(
+                urls: EngineProcessLogURLs(
+                    standardOutput: standardOutputURL,
+                    standardError: standardErrorURL
+                ),
+                standardOutput: standardOutput,
+                standardError: standardError
+            )
+        } catch {
+            try? standardOutput.close()
+            throw error
+        }
+    }
+
+    /// Session JSON is user-writable state. Never let a saved URL turn the log
+    /// tailer into an arbitrary-file reader: only regular, non-symlink direct
+    /// children of this supervisor's configured log directory are accepted.
+    private func validatedAttachedLogURL(_ candidate: URL?) -> URL? {
+        guard let logDirectory, let candidate, candidate.isFileURL else { return nil }
+        let directory = logDirectory.standardizedFileURL
+        let file = candidate.standardizedFileURL
+        guard file.deletingLastPathComponent() == directory else { return nil }
+        guard
+            file.deletingLastPathComponent().resolvingSymlinksInPath()
+                == directory.resolvingSymlinksInPath()
+        else {
+            return nil
+        }
+        #if canImport(Darwin)
+            var directoryInfo = stat()
+            var fileInfo = stat()
+            guard
+                Darwin.lstat(directory.path, &directoryInfo) == 0,
+                directoryInfo.st_mode & S_IFMT == S_IFDIR,
+                Darwin.lstat(file.path, &fileInfo) == 0,
+                fileInfo.st_mode & S_IFMT == S_IFREG
+            else {
+                return nil
+            }
+        #else
+            var isDirectory: ObjCBool = false
+            guard
+                FileManager.default.fileExists(
+                    atPath: file.path,
+                    isDirectory: &isDirectory
+                ), !isDirectory.boolValue
+            else {
+                return nil
+            }
+        #endif
+        return file
+    }
+
+    private nonisolated static func openAppendOnlyFile(at url: URL) throws -> FileHandle {
+        #if canImport(Darwin)
+            let descriptor = url.withUnsafeFileSystemRepresentation { path in
+                guard let path else { return Int32(-1) }
+                return Darwin.open(
+                    path,
+                    O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_APPEND,
+                    S_IRUSR | S_IWUSR
+                )
+            }
+            guard descriptor >= 0 else {
+                throw POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+            }
+            guard Darwin.fchmod(descriptor, S_IRUSR | S_IWUSR) == 0 else {
+                let error = POSIXError(POSIXErrorCode(rawValue: errno) ?? .EIO)
+                _ = Darwin.close(descriptor)
+                throw error
+            }
+            return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        #else
+            if !FileManager.default.createFile(
+                atPath: url.path,
+                contents: nil,
+                attributes: [.posixPermissions: 0o600]
+            ) {
+                throw CocoaError(.fileWriteUnknown)
+            }
+            let handle = try FileHandle(forWritingTo: url)
+            try handle.seekToEnd()
+            return handle
+        #endif
+    }
+
+    private func beginLogTails(urls: EngineProcessLogURLs, replayExisting: Bool) {
+        logTailShutdownTask?.cancel()
+        logTailShutdownTask = nil
+        cancelLogTails()
+        if let url = urls.standardOutput {
+            logTailTasks.append(
+                Self.makeLogTailTask(
+                    url: url,
+                    stream: .standardOutput,
+                    replayExisting: replayExisting,
+                    continuation: logContinuation
+                )
+            )
+        }
+        if let url = urls.standardError {
+            logTailTasks.append(
+                Self.makeLogTailTask(
+                    url: url,
+                    stream: .standardError,
+                    replayExisting: replayExisting,
+                    continuation: logContinuation
+                )
+            )
+        }
+    }
+
+    private func cancelLogTails() {
+        for task in logTailTasks { task.cancel() }
+        logTailTasks.removeAll()
+    }
+
+    private func scheduleLogTailShutdown() {
+        logTailShutdownTask?.cancel()
+        let expectedURLs = activeLogURLs
+        logTailShutdownTask = Task.detached { [weak self] in
+            // Let tailers drain data the child wrote immediately before exit.
+            try? await Task.sleep(for: .milliseconds(300))
+            await self?.finishLogTailShutdown(expectedURLs: expectedURLs)
+        }
+    }
+
+    private func finishLogTailShutdown(expectedURLs: EngineProcessLogURLs?) {
+        guard process == nil, attachedSession == nil, activeLogURLs == expectedURLs else {
+            return
+        }
+        cancelLogTails()
+        logTailShutdownTask = nil
+    }
+
+    private nonisolated static func makeLogTailTask(
+        url: URL,
+        stream: EngineLogEvent.Stream,
+        replayExisting: Bool,
+        continuation: AsyncStream<EngineLogEvent>.Continuation
+    ) -> Task<Void, Never> {
+        Task.detached(priority: .utility) {
+            await tailLogFile(
+                at: url,
+                stream: stream,
+                replayExisting: replayExisting,
+                continuation: continuation
+            )
+        }
+    }
+
+    private nonisolated static func tailLogFile(
+        at url: URL,
+        stream: EngineLogEvent.Stream,
+        replayExisting: Bool,
+        continuation: AsyncStream<EngineLogEvent>.Continuation
+    ) async {
+        var handle: FileHandle?
+        while !Task.isCancelled, handle == nil {
+            handle = openReadOnlyRegularFile(at: url)
+            if handle == nil {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+        }
+        guard let handle else { return }
+        defer { try? handle.close() }
+
+        if replayExisting,
+            let attributes = try? FileManager.default.attributesOfItem(atPath: url.path),
+            let size = (attributes[.size] as? NSNumber)?.uint64Value
+        {
+            // Replaying a bounded suffix makes restored UI logs useful without
+            // reading an unbounded long-running server log into memory.
+            let replayLimit: UInt64 = 256 * 1_024
+            try? handle.seek(toOffset: size > replayLimit ? size - replayLimit : 0)
+        }
+
+        var undecodedBytes = Data()
+        while !Task.isCancelled {
+            do {
+                if let data = try handle.read(upToCount: 64 * 1_024), !data.isEmpty {
+                    undecodedBytes.append(data)
+                    let decoded = decodeCompleteUTF8Prefix(from: undecodedBytes)
+                    undecodedBytes = decoded.remainder
+                    if !decoded.message.isEmpty {
+                        continuation.yield(
+                            EngineLogEvent(stream: stream, message: decoded.message)
+                        )
+                    }
+                    continue
+                }
+            } catch {
+                return
+            }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        if !undecodedBytes.isEmpty {
+            continuation.yield(
+                EngineLogEvent(
+                    stream: stream,
+                    message: String(decoding: undecodedBytes, as: UTF8.self)
+                )
+            )
+        }
+    }
+
+    private nonisolated static func openReadOnlyRegularFile(at url: URL) -> FileHandle? {
+        #if canImport(Darwin)
+            let descriptor = url.withUnsafeFileSystemRepresentation { path in
+                guard let path else { return Int32(-1) }
+                return Darwin.open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
+            }
+            guard descriptor >= 0 else { return nil }
+            var info = stat()
+            guard Darwin.fstat(descriptor, &info) == 0, info.st_mode & S_IFMT == S_IFREG else {
+                _ = Darwin.close(descriptor)
+                return nil
+            }
+            return FileHandle(fileDescriptor: descriptor, closeOnDealloc: true)
+        #else
+            return try? FileHandle(forReadingFrom: url)
+        #endif
+    }
+
+    private nonisolated static func decodeCompleteUTF8Prefix(
+        from data: Data
+    ) -> (message: String, remainder: Data) {
+        let maximumIncompleteSuffix = min(3, data.count)
+        for suffixCount in 0...maximumIncompleteSuffix {
+            let prefixCount = data.count - suffixCount
+            let prefix = data.prefix(prefixCount)
+            if let message = String(data: prefix, encoding: .utf8) {
+                return (
+                    message,
+                    suffixCount == 0 ? Data() : Data(data.suffix(suffixCount))
+                )
+            }
+        }
+        // Preserve progress even if a subprocess emitted invalid UTF-8.
+        return (String(decoding: data, as: UTF8.self), Data())
     }
 
     private func sanitizedEnvironment(_ configured: [String: String]) -> [String: String] {
@@ -356,6 +708,7 @@ public actor EngineProcessSupervisor {
         attachmentMonitorTask?.cancel()
         attachmentMonitorTask = nil
         attachedSession = nil
+        scheduleLogTailShutdown()
         let wasRequested = requestedStopProcessIdentifier == session.processIdentifier
         requestedStopProcessIdentifier = nil
         if let failure {
@@ -380,6 +733,7 @@ public actor EngineProcessSupervisor {
     private func processDidTerminate(processIdentifier: Int32, status: Int32) {
         guard process?.processIdentifier == processIdentifier else { return }
         process = nil
+        scheduleLogTailShutdown()
         let requestedStop = requestedStopProcessIdentifier == processIdentifier
         requestedStopProcessIdentifier = nil
         currentState =
@@ -398,6 +752,7 @@ public actor EngineProcessSupervisor {
 public enum EngineProcessError: LocalizedError {
     case alreadyRunning
     case executableNotFound(URL)
+    case insecureLogLocation(URL)
     case attachedProcessNotFound(Int32)
     case attachedProcessIdentityMismatch(Int32)
 
@@ -407,6 +762,8 @@ public enum EngineProcessError: LocalizedError {
             "An engine process is already running."
         case .executableNotFound(let url):
             "The engine executable is missing or not executable: \(url.path)"
+        case .insecureLogLocation(let url):
+            "The engine log directory is not a regular directory: \(url.path)"
         case .attachedProcessNotFound(let identifier):
             "The engine process \(identifier) is no longer running."
         case .attachedProcessIdentityMismatch(let identifier):

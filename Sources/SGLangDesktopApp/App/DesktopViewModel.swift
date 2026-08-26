@@ -72,7 +72,7 @@ final class DesktopViewModel: ObservableObject {
     private let modelLibrary: ModelLibrary
     private let sessionStore: EngineSessionStore
     private let processInspector = ProcessInspector()
-    private let supervisor = EngineProcessSupervisor()
+    private let supervisor: EngineProcessSupervisor
     private var monitorTask: Task<Void, Never>?
     private var foregroundSession: EngineSession?
     private var didAttemptSessionRecovery = false
@@ -86,6 +86,7 @@ final class DesktopViewModel: ObservableObject {
             self.runtimeLibrary = RuntimeLibrary(paths: paths)
             self.modelLibrary = ModelLibrary(paths: paths)
             self.sessionStore = EngineSessionStore(paths: paths)
+            self.supervisor = EngineProcessSupervisor(logDirectory: paths.logs)
         } catch {
             let fallback = AppPaths(
                 root: FileManager.default.temporaryDirectory
@@ -95,6 +96,7 @@ final class DesktopViewModel: ObservableObject {
             self.runtimeLibrary = RuntimeLibrary(paths: fallback)
             self.modelLibrary = ModelLibrary(paths: fallback)
             self.sessionStore = EngineSessionStore(paths: fallback)
+            self.supervisor = EngineProcessSupervisor(logDirectory: fallback.logs)
             self.lastError = error.localizedDescription
         }
 
@@ -351,6 +353,7 @@ final class DesktopViewModel: ObservableObject {
             }
             let processGroupIdentifier =
                 await supervisor.processGroupIdentifier() ?? processIdentifier
+            let logURLs = await supervisor.currentLogURLs()
             let session = EngineSession(
                 configuration: configuration,
                 engine: installation.manifest.engine,
@@ -358,7 +361,9 @@ final class DesktopViewModel: ObservableObject {
                 processGroupIdentifier: processGroupIdentifier,
                 modelPath: selectedModelPath,
                 servedModelName: servedModelName,
-                usesMLX: selectedUseMLX
+                usesMLX: selectedUseMLX,
+                standardOutputLogURL: logURLs?.standardOutput,
+                standardErrorLogURL: logURLs?.standardError
             )
             do {
                 try await sessionStore.upsert(session)

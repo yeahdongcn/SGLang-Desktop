@@ -17,6 +17,10 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
     public let port: UInt16
     public let healthPath: String
     public let startedAt: Date
+    /// Durable child-process output files. Older saved sessions do not have
+    /// these fields, so both remain optional when reconnecting.
+    public let standardOutputLogURL: URL?
+    public let standardErrorLogURL: URL?
 
     public init(
         id: UUID = UUID(),
@@ -30,7 +34,9 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
         usesMLX: Bool = true,
         port: UInt16,
         healthPath: String = "/health",
-        startedAt: Date = Date()
+        startedAt: Date = Date(),
+        standardOutputLogURL: URL? = nil,
+        standardErrorLogURL: URL? = nil
     ) {
         self.id = id
         self.installationID = installationID
@@ -44,6 +50,8 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
         self.port = port
         self.healthPath = healthPath.hasPrefix("/") ? healthPath : "/\(healthPath)"
         self.startedAt = startedAt
+        self.standardOutputLogURL = standardOutputLogURL?.standardizedFileURL
+        self.standardErrorLogURL = standardErrorLogURL?.standardizedFileURL
     }
 
     public init(
@@ -55,7 +63,9 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
         modelPath: String,
         servedModelName: String? = nil,
         usesMLX: Bool = true,
-        startedAt: Date = Date()
+        startedAt: Date = Date(),
+        standardOutputLogURL: URL? = nil,
+        standardErrorLogURL: URL? = nil
     ) {
         self.init(
             id: id,
@@ -69,7 +79,9 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
             usesMLX: usesMLX,
             port: configuration.port,
             healthPath: configuration.healthPath,
-            startedAt: startedAt
+            startedAt: startedAt,
+            standardOutputLogURL: standardOutputLogURL,
+            standardErrorLogURL: standardErrorLogURL
         )
     }
 
@@ -80,7 +92,7 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
     private enum CodingKeys: String, CodingKey {
         case id, installationID, engine, processIdentifier, processGroupIdentifier
         case runtimeExecutableURL, modelPath, servedModelName, usesMLX, port, healthPath
-        case startedAt
+        case startedAt, standardOutputLogURL, standardErrorLogURL
     }
 
     public init(from decoder: Decoder) throws {
@@ -100,7 +112,15 @@ public struct EngineSession: Codable, Equatable, Identifiable, Sendable {
             usesMLX: try values.decodeIfPresent(Bool.self, forKey: .usesMLX) ?? true,
             port: try values.decode(UInt16.self, forKey: .port),
             healthPath: try values.decode(String.self, forKey: .healthPath),
-            startedAt: try values.decode(Date.self, forKey: .startedAt)
+            startedAt: try values.decode(Date.self, forKey: .startedAt),
+            standardOutputLogURL: try values.decodeIfPresent(
+                URL.self,
+                forKey: .standardOutputLogURL
+            ),
+            standardErrorLogURL: try values.decodeIfPresent(
+                URL.self,
+                forKey: .standardErrorLogURL
+            )
         )
     }
 }
