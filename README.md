@@ -62,6 +62,9 @@ This initial repository includes:
 - a native SwiftUI application shell with Dashboard, Installations, Models,
   Logs, and Settings
 - Apple Silicon/macOS compatibility detection
+- actionable Mac/runtime/model/port diagnostics
+- per-model Advanced launch settings with effective-command preview
+- OpenAI API handoff to local clients such as AnythingLLM
 - a versioned runtime manifest schema
 - persistent runtime and model registries
 - safe managed-runtime adoption plus arbitrary local `sglang`/`sgl-omni` CLI adoption

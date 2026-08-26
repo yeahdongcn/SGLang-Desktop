@@ -56,6 +56,11 @@ final class DesktopViewModel: ObservableObject {
     @Published var modelPath = ""
     @Published var portText = "8000"
     @Published var useMLX = true
+    @Published var advancedSettings = AdvancedLaunchSettings()
+    @Published private(set) var diagnostics = DiagnosticReport(items: [])
+    @Published private(set) var isDiagnosing = true
+    @Published private(set) var repairStatus: String?
+    @Published private(set) var clientStatus: String?
     @Published private(set) var processState: EngineProcessState = .stopped
     @Published private(set) var healthStatus = "Stopped"
 
@@ -66,6 +71,7 @@ final class DesktopViewModel: ObservableObject {
     private let modelLibrary: ModelLibrary
     private let supervisor = EngineProcessSupervisor()
     private var monitorTask: Task<Void, Never>?
+    private var currentSettingsKey = "custom"
 
     init() {
         do {
@@ -126,6 +132,7 @@ final class DesktopViewModel: ObservableObject {
             }
         }
         await load()
+        await runDiagnostics()
     }
 
     private var catalogModels: [ManagedModel] {
@@ -171,6 +178,10 @@ final class DesktopViewModel: ObservableObject {
                     selectedInstallationID = omni.id
                     useMLX = true
                 }
+            }
+            if let preset = modelPresets.first(where: { $0.displayPath == modelPath }) {
+                currentSettingsKey = preset.id
+                advancedSettings = loadAdvancedSettings(for: preset)
             }
             lastError = nil
         } catch {
@@ -274,10 +285,26 @@ final class DesktopViewModel: ObservableObject {
     }
 
     func choosePreset(_ preset: ModelPreset) {
+        saveAdvancedSettings()
         modelPath = preset.displayPath
         useMLX = preset.defaultMLX
+        currentSettingsKey = preset.id
+        advancedSettings = loadAdvancedSettings(for: preset)
         if let installation = installations.first(where: { $0.manifest.engine == preset.engine }) {
             selectedInstallationID = installation.id
+        }
+    }
+
+    func resetAdvancedSettings() {
+        if let preset = modelPresets.first(where: { $0.id == currentSettingsKey }) {
+            UserDefaults.standard.removeObject(forKey: "advanced-launch.\(currentSettingsKey)")
+            advancedSettings = AdvancedLaunchSettings(
+                servedModelName: preset.repository,
+                maxRunningRequests: preset.engine == .sglangOmni ? "1" : "",
+                logLevel: "info"
+            )
+        } else {
+            advancedSettings = AdvancedLaunchSettings()
         }
     }
 
@@ -287,24 +314,46 @@ final class DesktopViewModel: ObservableObject {
                 installations.first(where: { $0.isActive })?.id
                 ?? installations.first?.id
         }
+        if let preset = modelPresets.first(where: { $0.displayPath == modelPath }) {
+            currentSettingsKey = preset.id
+            advancedSettings = loadAdvancedSettings(for: preset)
+        }
     }
 
     func startEngine() async {
+        do {
+            let configuration = try makeLaunchConfiguration()
+            saveAdvancedSettings()
+            try await supervisor.start(configuration)
+            processState = await supervisor.state()
+            healthStatus = "Loading model…"
+            monitorTask?.cancel()
+            monitorTask = Task { [weak self] in
+                guard let self else { return }
+                await self.monitorEngine(configuration: configuration, port: configuration.port)
+            }
+        } catch {
+            processState = .failed(message: error.localizedDescription)
+            healthStatus = "Failed"
+            lastError = error.localizedDescription
+        }
+    }
+
+    func makeLaunchConfiguration() throws -> EngineLaunchConfiguration {
         guard let installation = selectedInstallation else {
-            lastError = "先在 Installations 中添加一个本地 sglang 或 sgl-omni CLI。"
-            return
+            throw DesktopLaunchError.missingRuntime
         }
         guard !modelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            lastError = "请选择模型目录，或填写 Hugging Face 模型 ID。"
-            return
+            throw DesktopLaunchError.missingModel
         }
         guard let port = UInt16(portText), port > 0 else {
-            lastError = "端口必须是 1–65535 之间的数字。"
-            return
+            throw DesktopLaunchError.invalidValue(name: "Port", value: portText)
         }
 
-        var arguments = [
-            "serve",
+        var arguments =
+            installation.manifest.defaultArguments.isEmpty
+            ? ["serve"] : installation.manifest.defaultArguments
+        arguments += [
             "--model-path", modelPath,
             "--host", "127.0.0.1",
             "--port", String(port),
@@ -312,19 +361,32 @@ final class DesktopViewModel: ObservableObject {
         var environment: [String: String] = [
             "SGLANG_CACHE_DIR": paths.root.appending(path: "cache").path,
             "HF_HOME": paths.models.appending(path: "huggingface").path,
-            "SGLANG_OMNI_STRICT_PORT": "1",
         ]
-        if useMLX {
-            environment["SGLANG_USE_MLX"] = "1"
-        }
-        let servedModelName =
-            modelPresets.first(where: { $0.displayPath == modelPath })?.repository
-            ?? URL(fileURLWithPath: modelPath).lastPathComponent
+        if useMLX { environment["SGLANG_USE_MLX"] = "1" }
+
+        let servedModelName = effectiveServedModelName
         if installation.manifest.engine == .sglangOmni {
-            arguments += [
-                "--model-name", servedModelName,
-                "--asr.engine.max_running_requests", "1",
-            ]
+            environment["SGLANG_OMNI_STRICT_PORT"] = "1"
+            arguments += ["--model-name", servedModelName]
+            try appendPositiveInteger(
+                advancedSettings.maxRunningRequests.isEmpty
+                    ? "1" : advancedSettings.maxRunningRequests,
+                flag: "--asr.engine.max_running_requests",
+                name: "Max running requests",
+                to: &arguments
+            )
+            try appendPositiveInteger(
+                advancedSettings.contextLength,
+                flag: "--asr.engine.context_length",
+                name: "Context length",
+                to: &arguments
+            )
+            try appendPositiveInteger(
+                advancedSettings.maxTotalTokens,
+                flag: "--asr.engine.max_total_tokens",
+                name: "Max total tokens",
+                to: &arguments
+            )
             let ffmpeg = "/opt/homebrew/opt/ffmpeg@7/lib"
             if FileManager.default.fileExists(atPath: ffmpeg) {
                 environment["DYLD_LIBRARY_PATH"] = ffmpeg
@@ -334,9 +396,58 @@ final class DesktopViewModel: ObservableObject {
                 "--model-type", "llm",
                 "--served-model-name", servedModelName,
             ]
+            try appendPositiveInteger(
+                advancedSettings.maxRunningRequests,
+                flag: "--max-running-requests",
+                name: "Max running requests",
+                to: &arguments
+            )
+            try appendPositiveInteger(
+                advancedSettings.contextLength,
+                flag: "--context-length",
+                name: "Context length",
+                to: &arguments
+            )
+            try appendPositiveInteger(
+                advancedSettings.maxTotalTokens,
+                flag: "--max-total-tokens",
+                name: "Max total tokens",
+                to: &arguments
+            )
         }
 
-        let configuration = EngineLaunchConfiguration(
+        try appendFraction(
+            advancedSettings.memoryFractionStatic,
+            flag: "--mem-fraction-static",
+            name: "Memory fraction",
+            to: &arguments
+        )
+        if advancedSettings.logLevel != "info" {
+            arguments += ["--log-level", advancedSettings.logLevel]
+        }
+        if installation.manifest.engine == .sglang {
+            if advancedSettings.trustRemoteCode { arguments.append("--trust-remote-code") }
+            if advancedSettings.disableRadixCache { arguments.append("--disable-radix-cache") }
+            if advancedSettings.disableOverlapSchedule {
+                arguments.append("--disable-overlap-schedule")
+            }
+        } else {
+            if advancedSettings.disableRadixCache {
+                arguments += ["--asr.engine.disable_radix_cache", "true"]
+            }
+            if advancedSettings.disableOverlapSchedule {
+                arguments += ["--asr.engine.disable_overlap_schedule", "true"]
+            }
+        }
+
+        let extraArguments = try LaunchInputParser.arguments(from: advancedSettings.extraArguments)
+        try validateExtraArguments(extraArguments)
+        arguments += extraArguments
+        environment.merge(
+            try LaunchInputParser.environment(from: advancedSettings.extraEnvironment),
+            uniquingKeysWith: { _, custom in custom }
+        )
+        return EngineLaunchConfiguration(
             installationID: installation.id,
             executableURL: installation.executableURL,
             workingDirectory: installation.rootDirectory,
@@ -344,20 +455,27 @@ final class DesktopViewModel: ObservableObject {
             environment: environment,
             port: port
         )
+    }
 
+    var launchCommandPreview: String {
         do {
-            try await supervisor.start(configuration)
-            processState = await supervisor.state()
-            healthStatus = "Loading model…"
-            monitorTask?.cancel()
-            monitorTask = Task { [weak self] in
-                guard let self else { return }
-                await self.monitorEngine(configuration: configuration, port: port)
-            }
+            let configuration = try makeLaunchConfiguration()
+            return LaunchInputParser.shellEscapedPreview(
+                [configuration.executableURL.path] + configuration.arguments
+            )
         } catch {
-            processState = .failed(message: error.localizedDescription)
-            healthStatus = "Failed"
-            lastError = error.localizedDescription
+            return error.localizedDescription
+        }
+    }
+
+    var launchEnvironmentPreview: String {
+        do {
+            return try makeLaunchConfiguration().environment
+                .sorted(by: { $0.key < $1.key })
+                .map { "\($0.key)=\($0.value)" }
+                .joined(separator: "\n")
+        } catch {
+            return ""
         }
     }
 
@@ -378,6 +496,115 @@ final class DesktopViewModel: ObservableObject {
         #endif
     }
 
+    var openAIBaseURL: String {
+        "http://127.0.0.1:\(portText)/v1"
+    }
+
+    var effectiveServedModelName: String {
+        let configured = advancedSettings.servedModelName.trimmingCharacters(
+            in: .whitespacesAndNewlines
+        )
+        if !configured.isEmpty { return configured }
+        return modelPresets.first(where: { $0.displayPath == modelPath })?.repository
+            ?? URL(fileURLWithPath: modelPath).lastPathComponent
+    }
+
+    var canUseChatClient: Bool {
+        healthStatus.hasPrefix("Ready") && selectedInstallation?.manifest.engine == .sglang
+    }
+
+    func copyOpenAIBaseURL() {
+        #if os(macOS)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(openAIBaseURL, forType: .string)
+            clientStatus = "Copied \(openAIBaseURL)"
+        #endif
+    }
+
+    func launchAnythingLLM() {
+        #if os(macOS)
+            guard canUseChatClient else {
+                lastError = "Start a chat-capable SGLang model before opening AnythingLLM."
+                return
+            }
+            guard
+                let appURL = NSWorkspace.shared.urlForApplication(
+                    withBundleIdentifier: "com.anythingllm"
+                )
+            else {
+                lastError = "AnythingLLM is not installed in /Applications."
+                return
+            }
+            let setup = """
+                Provider: Generic OpenAI
+                Base URL: \(openAIBaseURL)
+                Model: \(effectiveServedModelName)
+                API key: leave blank
+                """
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(setup, forType: .string)
+            NSWorkspace.shared.openApplication(
+                at: appURL,
+                configuration: NSWorkspace.OpenConfiguration()
+            ) { [weak self] _, error in
+                Task { @MainActor in
+                    if let error {
+                        self?.lastError = error.localizedDescription
+                    } else {
+                        self?.clientStatus =
+                            "AnythingLLM opened. Generic OpenAI settings were copied to the clipboard."
+                    }
+                }
+            }
+        #endif
+    }
+
+    func runDiagnostics() async {
+        isDiagnosing = true
+        defer { isDiagnosing = false }
+        let port = UInt16(portText) ?? 8000
+        diagnostics = await AppleSystemDiagnostics().run(
+            host: host,
+            installations: installations,
+            models: models,
+            paths: paths,
+            port: port,
+            activePortIsExpected: isEngineRunning
+        )
+    }
+
+    func repairDiagnostic(_ item: DiagnosticItem) async {
+        guard let action = item.repairAction else { return }
+        repairStatus = "Repairing \(item.title)…"
+        defer { repairStatus = nil }
+        switch action {
+        case .redetect:
+            await bootstrapAndLoad()
+        case .chooseFreePort:
+            if let port = LocalPort.availablePort() { portText = String(port) }
+        case .openSoftwareUpdate:
+            #if os(macOS)
+                NSWorkspace.shared.open(
+                    URL(
+                        string:
+                            "x-apple.systempreferences:com.apple.Software-Update-Settings.extension"
+                    )!
+                )
+            #endif
+        case .openInstallations:
+            selection = .installations
+        case .openModels:
+            selection = .models
+        }
+        await runDiagnostics()
+    }
+
+    func repairAllDiagnostics() async {
+        for item in diagnostics.items where item.status == .failed && item.repairAction != nil {
+            await repairDiagnostic(item)
+        }
+    }
+
     var selectedInstallation: RuntimeInstallation? {
         guard let selectedInstallationID else { return nil }
         return installations.first(where: { $0.id == selectedInstallationID })
@@ -388,6 +615,77 @@ final class DesktopViewModel: ObservableObject {
         if case .starting = processState { return true }
         if case .stopping = processState { return true }
         return false
+    }
+
+    private func appendPositiveInteger(
+        _ rawValue: String,
+        flag: String,
+        name: String,
+        to arguments: inout [String]
+    ) throws {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        guard let parsed = Int(value), parsed > 0 else {
+            throw DesktopLaunchError.invalidValue(name: name, value: rawValue)
+        }
+        arguments += [flag, String(parsed)]
+    }
+
+    private func appendFraction(
+        _ rawValue: String,
+        flag: String,
+        name: String,
+        to arguments: inout [String]
+    ) throws {
+        let value = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return }
+        guard let parsed = Double(value), parsed > 0, parsed <= 1 else {
+            throw DesktopLaunchError.invalidValue(name: name, value: rawValue)
+        }
+        arguments += [flag, String(parsed)]
+    }
+
+    private func validateExtraArguments(_ arguments: [String]) throws {
+        let reserved = [
+            "--model-path", "--host", "--port", "--model-name", "--served-model-name",
+            "--model-type", "--context-length", "--max-running-requests",
+            "--max-total-tokens", "--mem-fraction-static", "--log-level",
+            "--trust-remote-code", "--disable-radix-cache", "--disable-overlap-schedule",
+            "--asr.engine.context_length", "--asr.engine.max_running_requests",
+            "--asr.engine.max_total_tokens", "--asr.engine.disable_radix_cache",
+            "--asr.engine.disable_overlap_schedule",
+        ]
+        for argument in arguments {
+            if let flag = reserved.first(where: {
+                argument == $0 || argument.hasPrefix("\($0)=")
+            }) {
+                throw DesktopLaunchError.reservedArgument(flag)
+            }
+        }
+    }
+
+    private func loadAdvancedSettings(for preset: ModelPreset) -> AdvancedLaunchSettings {
+        let key = "advanced-launch.\(preset.id)"
+        if let data = UserDefaults.standard.data(forKey: key),
+            var decoded = try? JSONDecoder().decode(AdvancedLaunchSettings.self, from: data)
+        {
+            if (try? LaunchInputParser.environment(from: decoded.extraEnvironment)) == nil {
+                decoded.extraEnvironment = ""
+            }
+            return decoded
+        }
+        return AdvancedLaunchSettings(
+            servedModelName: preset.repository,
+            maxRunningRequests: preset.engine == .sglangOmni ? "1" : "",
+            logLevel: "info"
+        )
+    }
+
+    private func saveAdvancedSettings() {
+        guard (try? LaunchInputParser.environment(from: advancedSettings.extraEnvironment)) != nil
+        else { return }
+        guard let data = try? JSONEncoder().encode(advancedSettings) else { return }
+        UserDefaults.standard.set(data, forKey: "advanced-launch.\(currentSettingsKey)")
     }
 
     func dismissError() {
@@ -439,5 +737,25 @@ final class DesktopViewModel: ObservableObject {
 
     deinit {
         monitorTask?.cancel()
+    }
+}
+
+private enum DesktopLaunchError: LocalizedError {
+    case missingRuntime
+    case missingModel
+    case invalidValue(name: String, value: String)
+    case reservedArgument(String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingRuntime:
+            "Select an SGLang or SGLang-Omni runtime."
+        case .missingModel:
+            "Select a model directory or enter a model repository ID."
+        case .invalidValue(let name, let value):
+            "\(name) has an invalid value: \(value)"
+        case .reservedArgument(let flag):
+            "Extra arguments cannot override the Desktop-managed option \(flag)."
+        }
     }
 }

@@ -99,7 +99,7 @@ cat >"$CORE_ROOT/runtime.json" <<JSON
   "distribution": "localVirtualEnvironment",
   "artifactKind": "complete",
   "entrypoint": "bin/sglang",
-  "capabilities": ["qwen3-0.6b", "torch-mps"]
+  "capabilities": ["qwen3-0.6b", "mlx", "torch-mps"]
 }
 JSON
 cat >"$OMNI_ROOT/runtime.json" <<JSON
