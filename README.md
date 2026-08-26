@@ -72,6 +72,7 @@ This initial repository includes:
 - staged archive validation and atomic runtime installation
 - compatible base-runtime and engine-overlay composition
 - sidecar process supervision and captured stdout/stderr
+- persistent engine sessions with safe reconnect after an app relaunch
 - HTTP readiness probing
 - Swift Testing coverage for the core storage and validation contracts
 

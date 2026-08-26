@@ -52,6 +52,7 @@ final class DesktopViewModel: ObservableObject {
     @Published private(set) var logEvents: [EngineLogEvent] = []
     @Published private(set) var lastError: String?
     @Published private(set) var isLoading = true
+    @Published private(set) var isRecoveringSession = true
     @Published var selectedInstallationID: UUID?
     @Published var modelPath = ""
     @Published var portText = "8000"
@@ -62,15 +63,19 @@ final class DesktopViewModel: ObservableObject {
     @Published private(set) var repairStatus: String?
     @Published private(set) var clientStatus: String?
     @Published private(set) var processState: EngineProcessState = .stopped
-    @Published private(set) var healthStatus = "Stopped"
+    @Published private(set) var healthStatus = "Checking previous session…"
 
     let host = HostSystemProfile.current
     let paths: AppPaths
 
     private let runtimeLibrary: RuntimeLibrary
     private let modelLibrary: ModelLibrary
+    private let sessionStore: EngineSessionStore
+    private let processInspector = ProcessInspector()
     private let supervisor = EngineProcessSupervisor()
     private var monitorTask: Task<Void, Never>?
+    private var foregroundSession: EngineSession?
+    private var didAttemptSessionRecovery = false
     private var currentSettingsKey = "custom"
 
     init() {
@@ -80,6 +85,7 @@ final class DesktopViewModel: ObservableObject {
             self.paths = paths
             self.runtimeLibrary = RuntimeLibrary(paths: paths)
             self.modelLibrary = ModelLibrary(paths: paths)
+            self.sessionStore = EngineSessionStore(paths: paths)
         } catch {
             let fallback = AppPaths(
                 root: FileManager.default.temporaryDirectory
@@ -88,6 +94,7 @@ final class DesktopViewModel: ObservableObject {
             self.paths = fallback
             self.runtimeLibrary = RuntimeLibrary(paths: fallback)
             self.modelLibrary = ModelLibrary(paths: fallback)
+            self.sessionStore = EngineSessionStore(paths: fallback)
             self.lastError = error.localizedDescription
         }
 
@@ -132,6 +139,11 @@ final class DesktopViewModel: ObservableObject {
             }
         }
         await load()
+        if !didAttemptSessionRecovery {
+            didAttemptSessionRecovery = true
+            await recoverEngineSession()
+            isRecoveringSession = false
+        }
         await runDiagnostics()
     }
 
@@ -322,15 +334,48 @@ final class DesktopViewModel: ObservableObject {
 
     func startEngine() async {
         do {
+            guard !isRecoveringSession else {
+                throw DesktopLaunchError.sessionRecoveryInProgress
+            }
             let configuration = try makeLaunchConfiguration()
+            guard let installation = selectedInstallation else {
+                throw DesktopLaunchError.missingRuntime
+            }
+            let servedModelName = effectiveServedModelName
+            let selectedModelPath = modelPath
+            let selectedUseMLX = useMLX
             saveAdvancedSettings()
             try await supervisor.start(configuration)
+            guard let processIdentifier = await supervisor.processIdentifier() else {
+                throw DesktopLaunchError.missingProcessIdentity
+            }
+            let processGroupIdentifier =
+                await supervisor.processGroupIdentifier() ?? processIdentifier
+            let session = EngineSession(
+                configuration: configuration,
+                engine: installation.manifest.engine,
+                processIdentifier: processIdentifier,
+                processGroupIdentifier: processGroupIdentifier,
+                modelPath: selectedModelPath,
+                servedModelName: servedModelName,
+                usesMLX: selectedUseMLX
+            )
+            do {
+                try await sessionStore.upsert(session)
+            } catch {
+                // The process is already running, so keep it controllable and
+                // make the durability problem visible instead of pretending
+                // launch failed.
+                lastError =
+                    "Engine started, but its session could not be saved: \(error.localizedDescription)"
+            }
+            foregroundSession = session
             processState = await supervisor.state()
             healthStatus = "Loading model…"
             monitorTask?.cancel()
             monitorTask = Task { [weak self] in
                 guard let self else { return }
-                await self.monitorEngine(configuration: configuration, port: configuration.port)
+                await self.monitorEngine(session: session, initiallyReady: false)
             }
         } catch {
             processState = .failed(message: error.localizedDescription)
@@ -483,7 +528,15 @@ final class DesktopViewModel: ObservableObject {
         monitorTask?.cancel()
         await supervisor.stop()
         processState = await supervisor.state()
-        healthStatus = "Stopped"
+        guard let session = foregroundSession else {
+            healthStatus = processState == .stopped ? "Stopped" : "Stopping…"
+            return
+        }
+        healthStatus = "Stopping…"
+        monitorTask = Task { [weak self] in
+            guard let self else { return }
+            await self.monitorEngine(session: session, initiallyReady: true)
+        }
     }
 
     func openAPI() {
@@ -701,37 +754,217 @@ final class DesktopViewModel: ObservableObject {
         }
     }
 
+    private func recoverEngineSession() async {
+        guard await supervisor.processIdentifier() == nil else { return }
+
+        let savedSessions: [EngineSession]
+        do {
+            savedSessions = try await sessionStore.sessions()
+        } catch {
+            savedSessions = []
+            lastError =
+                "Could not read previous engine sessions: \(error.localizedDescription)"
+        }
+
+        do {
+            for session in savedSessions {
+                let snapshot: ProcessSnapshot?
+                do {
+                    snapshot = try processInspector.snapshot(
+                        processIdentifier: session.processIdentifier
+                    )
+                } catch {
+                    // A transient failure to run `ps` is not evidence that the
+                    // saved process is stale. Leave it for the next launch.
+                    continue
+                }
+                guard let snapshot else {
+                    try? await sessionStore.remove(id: session.id)
+                    continue
+                }
+                guard processInspector.matches(snapshot, session: session) else {
+                    try? await sessionStore.remove(id: session.id)
+                    continue
+                }
+
+                do {
+                    try await supervisor.attach(to: session)
+                    await presentRecoveredSession(session)
+                    return
+                } catch {
+                    if !processInspector.isAlive(
+                        processIdentifier: session.processIdentifier
+                    ) {
+                        try? await sessionStore.remove(id: session.id)
+                    }
+                }
+            }
+
+            if let session = try discoverLegacyManagedSession() {
+                try await supervisor.attach(to: session)
+                do {
+                    try await sessionStore.upsert(session)
+                } catch {
+                    lastError =
+                        "Reconnected to the engine, but its session could not be saved: \(error.localizedDescription)"
+                }
+                await presentRecoveredSession(session)
+                return
+            }
+            processState = .stopped
+            healthStatus = "Stopped"
+        } catch {
+            processState = .stopped
+            healthStatus = "Stopped"
+            lastError =
+                "Could not recover the previous engine session: \(error.localizedDescription)"
+        }
+    }
+
+    /// Adopts servers launched by an older Desktop build which predates
+    /// sessions.json. The process must be a dedicated process-group leader and
+    /// its actual command must live below this app's managed runtimes root.
+    private func discoverLegacyManagedSession() throws -> EngineSession? {
+        let managedRuntimePrefix = paths.runtimes.standardizedFileURL.path + "/"
+        let preferredPort = UInt16(portText)
+        let candidates = try processInspector.managedServerSnapshots()
+            .filter {
+                $0.process.processIdentifier > 1
+                    && $0.process.processIdentifier != ProcessInfo.processInfo.processIdentifier
+                    && $0.process.processGroupIdentifier == $0.process.processIdentifier
+                    && $0.process.command.hasPrefix(managedRuntimePrefix)
+            }
+            .sorted { lhs, rhs in
+                let lhsPreferred = lhs.port == preferredPort
+                let rhsPreferred = rhs.port == preferredPort
+                if lhsPreferred != rhsPreferred { return lhsPreferred }
+                return lhs.process.processIdentifier > rhs.process.processIdentifier
+            }
+
+        for candidate in candidates {
+            guard
+                let installation = installations.first(where: {
+                    $0.manifest.engine == candidate.engine
+                        && $0.manifest.artifactKind == .complete
+                })
+            else { continue }
+
+            let session = EngineSession(
+                installationID: installation.id,
+                engine: candidate.engine,
+                processIdentifier: candidate.process.processIdentifier,
+                processGroupIdentifier: candidate.process.processGroupIdentifier,
+                runtimeExecutableURL: installation.executableURL,
+                modelPath: candidate.modelPath,
+                servedModelName: candidate.servedModelName,
+                usesMLX: true,
+                port: candidate.port
+            )
+            if processInspector.matches(candidate.process, session: session) {
+                return session
+            }
+        }
+        return nil
+    }
+
+    private func presentRecoveredSession(_ session: EngineSession) async {
+        foregroundSession = session
+        selectedInstallationID =
+            installations.first(where: { $0.id == session.installationID })?.id
+            ?? installations.first(where: {
+                $0.manifest.engine == session.engine
+                    && $0.manifest.artifactKind == .complete
+            })?.id
+        modelPath = session.modelPath
+        portText = String(session.port)
+        useMLX = session.usesMLX
+
+        if let preset = modelPresets.first(where: {
+            $0.displayPath == session.modelPath
+                || $0.repository == session.servedModelName
+        }) {
+            currentSettingsKey = preset.id
+            advancedSettings = loadAdvancedSettings(for: preset)
+        } else {
+            currentSettingsKey = "custom"
+            advancedSettings = AdvancedLaunchSettings()
+        }
+        if let servedModelName = session.servedModelName, !servedModelName.isEmpty {
+            advancedSettings.servedModelName = servedModelName
+        }
+
+        processState = await supervisor.state()
+        healthStatus = "Running · Reconnected · http://127.0.0.1:\(session.port)"
+        clientStatus = "Reconnected to engine process \(session.processIdentifier)."
+        let initiallyReady = await HealthProbe().isReady(url: session.healthURL)
+        guard foregroundSession?.id == session.id else { return }
+        if initiallyReady {
+            healthStatus = "Ready · Reconnected · http://127.0.0.1:\(session.port)"
+        }
+        monitorTask?.cancel()
+        monitorTask = Task { [weak self] in
+            guard let self else { return }
+            await self.monitorEngine(session: session, initiallyReady: initiallyReady)
+        }
+    }
+
     private func monitorEngine(
-        configuration: EngineLaunchConfiguration,
-        port: UInt16
+        session: EngineSession,
+        initiallyReady: Bool
     ) async {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(600))
-        var becameReady = false
+        var becameReady = initiallyReady
+        var consecutiveHealthFailures = 0
+        var nextHealthProbe = clock.now
 
         while !Task.isCancelled {
+            guard foregroundSession?.id == session.id else { return }
             let state = await supervisor.state()
+            guard foregroundSession?.id == session.id else { return }
             processState = state
             switch state {
             case .failed(let message):
                 healthStatus = "Failed"
                 lastError = message
+                try? await sessionStore.remove(id: session.id)
+                foregroundSession = nil
                 return
             case .stopped:
                 healthStatus = becameReady ? "Stopped" : "Exited during startup"
+                try? await sessionStore.remove(id: session.id)
+                foregroundSession = nil
                 return
-            case .starting, .running, .stopping:
+            case .stopping:
+                healthStatus = "Stopping…"
+                try? await clock.sleep(for: .milliseconds(250))
+                continue
+            case .starting, .running:
                 break
             }
 
-            if !becameReady, await HealthProbe().isReady(url: configuration.healthURL) {
-                becameReady = true
-                healthStatus = "Ready · http://127.0.0.1:\(port)"
-            } else if !becameReady, clock.now >= deadline {
-                healthStatus = "Startup timed out"
-                return
+            if clock.now >= nextHealthProbe {
+                let isReady = await HealthProbe().isReady(url: session.healthURL)
+                guard !Task.isCancelled, foregroundSession?.id == session.id else { return }
+                if isReady {
+                    becameReady = true
+                    consecutiveHealthFailures = 0
+                    healthStatus = "Ready · http://127.0.0.1:\(session.port)"
+                } else if becameReady {
+                    consecutiveHealthFailures += 1
+                    if consecutiveHealthFailures >= 2 {
+                        healthStatus =
+                            "Running · API temporarily unavailable · 127.0.0.1:\(session.port)"
+                    }
+                } else if clock.now >= deadline {
+                    healthStatus = "Startup timed out"
+                    return
+                }
+                nextHealthProbe = clock.now.advanced(
+                    by: becameReady ? .seconds(3) : .milliseconds(500)
+                )
             }
-            try? await clock.sleep(for: .milliseconds(500))
+            try? await clock.sleep(for: .milliseconds(250))
         }
     }
 
@@ -743,6 +976,8 @@ final class DesktopViewModel: ObservableObject {
 private enum DesktopLaunchError: LocalizedError {
     case missingRuntime
     case missingModel
+    case missingProcessIdentity
+    case sessionRecoveryInProgress
     case invalidValue(name: String, value: String)
     case reservedArgument(String)
 
@@ -752,6 +987,10 @@ private enum DesktopLaunchError: LocalizedError {
             "Select an SGLang or SGLang-Omni runtime."
         case .missingModel:
             "Select a model directory or enter a model repository ID."
+        case .missingProcessIdentity:
+            "The engine started without a recoverable process identity."
+        case .sessionRecoveryInProgress:
+            "Wait for the previous engine session check to finish."
         case .invalidValue(let name, let value):
             "\(name) has an invalid value: \(value)"
         case .reservedArgument(let flag):

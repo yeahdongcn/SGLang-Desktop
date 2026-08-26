@@ -37,8 +37,10 @@ The application target renders state and coordinates explicit user actions.
 3. A verified runtime moves atomically into `runtimes/<id>/<version>/`.
 4. Activation changes metadata only; it never rewrites the previous runtime.
 5. Failed startup can restore the previously active runtime.
-6. Engine state is determined from the child process plus HTTP health, not
-   solely from a successful `Process.run()` call.
+6. Engine state is determined from a validated process identity plus HTTP
+   health, not solely from a successful `Process.run()` call. Non-secret
+   session identity is persisted so a relaunched app can reconnect to a server
+   that outlived its original UI process.
 7. Environment variables are constructed explicitly and do not inherit user
    Python, uv, or Homebrew configuration accidentally.
 8. The initial distribution ships outside the Mac App Store using Developer ID,

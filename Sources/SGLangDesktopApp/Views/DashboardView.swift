@@ -196,6 +196,7 @@ private struct EngineControlCard: View {
                         Task { await model.startEngine() }
                     }
                     .buttonStyle(.borderedProminent)
+                    .disabled(model.isLoading || model.isRecoveringSession)
                 }
                 Button("Open API") { model.openAPI() }
                     .disabled(!model.healthStatus.hasPrefix("Ready"))

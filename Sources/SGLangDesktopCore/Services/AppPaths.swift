@@ -24,6 +24,7 @@ public struct AppPaths: Equatable, Sendable {
     public var state: URL { root.appending(path: "state", directoryHint: .isDirectory) }
     public var installationsFile: URL { state.appending(path: "installations.json") }
     public var modelsFile: URL { state.appending(path: "models.json") }
+    public var sessionsFile: URL { state.appending(path: "sessions.json") }
 
     public func createRequiredDirectories(fileManager: FileManager = .default) throws {
         for directory in [root, runtimes, runtimeStaging, models, logs, state] {

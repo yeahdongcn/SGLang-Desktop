@@ -11,4 +11,5 @@ import Testing
     #expect(paths.models.path == "/tmp/sglang-desktop-tests/models")
     #expect(paths.logs.path == "/tmp/sglang-desktop-tests/logs")
     #expect(paths.installationsFile.path.hasPrefix(paths.root.path))
+    #expect(paths.sessionsFile.path == "/tmp/sglang-desktop-tests/state/sessions.json")
 }
