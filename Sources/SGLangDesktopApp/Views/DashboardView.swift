@@ -1,6 +1,10 @@
 import SwiftUI
 import UniformTypeIdentifiers
 
+#if os(macOS)
+    import AppKit
+#endif
+
 struct DashboardView: View {
     @EnvironmentObject private var model: DesktopViewModel
     @State private var isChoosingModel = false
@@ -10,11 +14,7 @@ struct DashboardView: View {
             VStack(alignment: .leading, spacing: 24) {
                 VStack(alignment: .leading, spacing: 6) {
                     HStack(spacing: 14) {
-                        Image("sglang-logo-square", bundle: .module)
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 54, height: 62)
-                            .clipShape(RoundedRectangle(cornerRadius: 10))
+                        SGLangLogo()
                         VStack(alignment: .leading, spacing: 4) {
                             Text("Run SGLang locally")
                                 .font(.largeTitle.bold())
@@ -75,6 +75,29 @@ struct DashboardView: View {
                 if hasAccess { url.stopAccessingSecurityScopedResource() }
             }
         }
+    }
+}
+
+private struct SGLangLogo: View {
+    var body: some View {
+        #if os(macOS)
+            if let url = Bundle.module.url(
+                forResource: "sglang-logo-square",
+                withExtension: "png"
+            ), let image = NSImage(contentsOf: url) {
+                Image(nsImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 54, height: 62)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+            } else {
+                Image(systemName: "bolt.horizontal.circle.fill")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 54, height: 54)
+                    .foregroundStyle(.tint)
+            }
+        #endif
     }
 }
 
