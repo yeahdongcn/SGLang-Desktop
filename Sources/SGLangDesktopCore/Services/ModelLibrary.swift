@@ -15,7 +15,11 @@ public actor ModelLibrary {
 
     public func upsert(_ model: ManagedModel) async throws {
         var records = try await store.load()
-        records.removeAll { $0.id == model.id }
+        records.removeAll {
+            $0.id == model.id
+                || ($0.repository == model.repository
+                    && (model.localDirectory == nil || $0.localDirectory == model.localDirectory))
+        }
         records.append(model)
         try await store.save(records)
     }

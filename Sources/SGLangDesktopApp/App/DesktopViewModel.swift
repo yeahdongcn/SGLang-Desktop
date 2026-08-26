@@ -2,8 +2,23 @@ import Combine
 import Foundation
 import SGLangDesktopCore
 
+#if os(macOS)
+    import AppKit
+#endif
+
 @MainActor
 final class DesktopViewModel: ObservableObject {
+    struct ModelPreset: Identifiable, Equatable {
+        let id: String
+        let title: String
+        let repository: String
+        let engine: EngineKind
+        let defaultMLX: Bool
+        let localPath: String?
+
+        var displayPath: String { localPath ?? repository }
+    }
+
     enum Section: String, CaseIterable, Identifiable {
         case dashboard
         case installations
@@ -37,6 +52,12 @@ final class DesktopViewModel: ObservableObject {
     @Published private(set) var logEvents: [EngineLogEvent] = []
     @Published private(set) var lastError: String?
     @Published private(set) var isLoading = true
+    @Published var selectedInstallationID: UUID?
+    @Published var modelPath = ""
+    @Published var portText = "8000"
+    @Published var useMLX = true
+    @Published private(set) var processState: EngineProcessState = .stopped
+    @Published private(set) var healthStatus = "Stopped"
 
     let host = HostSystemProfile.current
     let paths: AppPaths
@@ -44,6 +65,7 @@ final class DesktopViewModel: ObservableObject {
     private let runtimeLibrary: RuntimeLibrary
     private let modelLibrary: ModelLibrary
     private let supervisor = EngineProcessSupervisor()
+    private var monitorTask: Task<Void, Never>?
 
     init() {
         do {
@@ -63,8 +85,64 @@ final class DesktopViewModel: ObservableObject {
             self.lastError = error.localizedDescription
         }
 
-        Task { await load() }
+        Task { await bootstrapAndLoad() }
         Task { await collectLogs() }
+    }
+
+    private func bootstrapAndLoad() async {
+        // First launch should discover the developer runtimes and model caches
+        // already present on this Mac. This is read-only and never installs
+        // packages or downloads weights.
+        let discoveredRuntimes = LocalRuntimeDiscovery().discover()
+        for installation in discoveredRuntimes {
+            do {
+                try await runtimeLibrary.register(installation)
+                try await runtimeLibrary.activate(id: installation.id)
+            } catch {
+                // Already registered or not executable; continue discovery.
+            }
+        }
+        let preferredEngines = Set(
+            discoveredRuntimes
+                .filter { $0.rootDirectory.path.contains("SGLang Desktop/runtimes") }
+                .map { $0.manifest.engine }
+        )
+        if !preferredEngines.isEmpty {
+            for installation in (try? await runtimeLibrary.installations()) ?? []
+            where preferredEngines.contains(installation.manifest.engine)
+                && installation.rootDirectory.path.contains(".venv-apple")
+            {
+                try? await runtimeLibrary.removeRegistration(id: installation.id)
+            }
+        }
+        for model in catalogModels {
+            do { try await modelLibrary.upsert(model) } catch {
+                // Keep the UI usable when one catalog record cannot persist.
+            }
+        }
+        for model in ModelCacheDiscovery().discover() {
+            do { try await modelLibrary.upsert(model) } catch {
+                // Keep the UI usable when one cache record cannot persist.
+            }
+        }
+        await load()
+    }
+
+    private var catalogModels: [ManagedModel] {
+        [
+            ManagedModel(
+                repository: "Qwen/Qwen3-0.6B",
+                displayName: "Qwen3 0.6B",
+                compatibleEngines: [.sglang],
+                state: .available
+            ),
+            ManagedModel(
+                repository: "mlx-community/Qwen3-ASR-0.6B-4bit",
+                displayName: "Qwen3-ASR 0.6B 4-bit",
+                compatibleEngines: [.sglangOmni],
+                state: .available
+            ),
+        ]
     }
 
     func load() async {
@@ -74,6 +152,26 @@ final class DesktopViewModel: ObservableObject {
             async let modelRecords = modelLibrary.models()
             installations = try await runtimeRecords
             models = try await modelRecords
+            if selectedInstallationID == nil {
+                selectedInstallationID =
+                    installations.first(where: { $0.isActive })?.id
+                    ?? installations.first?.id
+            }
+            if modelPath.isEmpty {
+                let preferred =
+                    models.first {
+                        $0.repository == "mlx-community/Qwen3-ASR-0.6B-4bit"
+                    } ?? models.first {
+                        $0.repository == "Qwen/Qwen3-0.6B"
+                    } ?? models.first(where: { $0.state == .ready })
+                modelPath = preferred?.localDirectory?.path ?? ""
+                if preferred?.repository == "mlx-community/Qwen3-ASR-0.6B-4bit",
+                    let omni = installations.first(where: { $0.manifest.engine == .sglangOmni })
+                {
+                    selectedInstallationID = omni.id
+                    useMLX = true
+                }
+            }
             lastError = nil
         } catch {
             lastError = error.localizedDescription
@@ -95,7 +193,9 @@ final class DesktopViewModel: ObservableObject {
                 engine: manifest.engine,
                 displayName: "Local \(manifest.displayName)"
             )
-            try await runtimeLibrary.register(installation)
+            var activeInstallation = installation
+            activeInstallation.isActive = true
+            try await runtimeLibrary.register(activeInstallation)
             await load()
         } catch {
             lastError = error.localizedDescription
@@ -107,7 +207,9 @@ final class DesktopViewModel: ObservableObject {
             let installation = try LocalRuntimeAdopter().makeInstallation(
                 executableURL: executableURL
             )
-            try await runtimeLibrary.register(installation)
+            var activeInstallation = installation
+            activeInstallation.isActive = true
+            try await runtimeLibrary.register(activeInstallation)
             await load()
         } catch {
             lastError = error.localizedDescription
@@ -123,6 +225,176 @@ final class DesktopViewModel: ObservableObject {
         }
     }
 
+    func selectModelDirectory(_ url: URL) async {
+        let path = url.standardizedFileURL.path
+        modelPath = path
+        let model = ManagedModel(
+            repository: path,
+            displayName: url.lastPathComponent,
+            localDirectory: url.standardizedFileURL,
+            compatibleEngines: Set(EngineKind.allCases),
+            state: .ready
+        )
+        do {
+            try await modelLibrary.upsert(model)
+            await load()
+        } catch {
+            lastError = error.localizedDescription
+        }
+    }
+
+    var modelPresets: [ModelPreset] {
+        let qwen = models.first {
+            $0.repository == "Qwen/Qwen3-0.6B"
+                || $0.repository.lowercased().contains("qwen3-0.6b")
+                    && !$0.repository.lowercased().contains("asr")
+        }
+        let asr = models.first {
+            $0.repository == "mlx-community/Qwen3-ASR-0.6B-4bit"
+                || $0.repository.lowercased().contains("qwen3-asr-0.6b-4bit")
+        }
+        return [
+            ModelPreset(
+                id: "qwen3-0.6b",
+                title: "Qwen3 0.6B · SGLang",
+                repository: "Qwen/Qwen3-0.6B",
+                engine: .sglang,
+                defaultMLX: false,
+                localPath: qwen?.localDirectory?.path
+            ),
+            ModelPreset(
+                id: "qwen3-asr-0.6b-4bit",
+                title: "Qwen3-ASR 0.6B 4-bit · SGLang-Omni",
+                repository: "mlx-community/Qwen3-ASR-0.6B-4bit",
+                engine: .sglangOmni,
+                defaultMLX: true,
+                localPath: asr?.localDirectory?.path
+            ),
+        ]
+    }
+
+    func choosePreset(_ preset: ModelPreset) {
+        modelPath = preset.displayPath
+        useMLX = preset.defaultMLX
+        if let installation = installations.first(where: { $0.manifest.engine == preset.engine }) {
+            selectedInstallationID = installation.id
+        }
+    }
+
+    func prepareSelection() {
+        if selectedInstallationID == nil {
+            selectedInstallationID =
+                installations.first(where: { $0.isActive })?.id
+                ?? installations.first?.id
+        }
+    }
+
+    func startEngine() async {
+        guard let installation = selectedInstallation else {
+            lastError = "先在 Installations 中添加一个本地 sglang 或 sgl-omni CLI。"
+            return
+        }
+        guard !modelPath.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            lastError = "请选择模型目录，或填写 Hugging Face 模型 ID。"
+            return
+        }
+        guard let port = UInt16(portText), port > 0 else {
+            lastError = "端口必须是 1–65535 之间的数字。"
+            return
+        }
+
+        var arguments = [
+            "serve",
+            "--model-path", modelPath,
+            "--host", "127.0.0.1",
+            "--port", String(port),
+        ]
+        var environment: [String: String] = [
+            "SGLANG_CACHE_DIR": paths.root.appending(path: "cache").path,
+            "HF_HOME": paths.models.appending(path: "huggingface").path,
+            "SGLANG_OMNI_STRICT_PORT": "1",
+        ]
+        if installation.manifest.engine == .sglangOmni {
+            arguments += [
+                "--model-name", URL(fileURLWithPath: modelPath).lastPathComponent,
+                "--asr.engine.max_running_requests", "1",
+            ]
+            if useMLX {
+                environment["SGLANG_USE_MLX"] = "1"
+            }
+            let ffmpeg = "/opt/homebrew/opt/ffmpeg@7/lib"
+            if FileManager.default.fileExists(atPath: ffmpeg) {
+                environment["DYLD_LIBRARY_PATH"] = ffmpeg
+            }
+        }
+
+        let configuration = EngineLaunchConfiguration(
+            installationID: installation.id,
+            executableURL: installation.executableURL,
+            workingDirectory: installation.rootDirectory,
+            arguments: arguments,
+            environment: environment,
+            port: port
+        )
+
+        do {
+            try await supervisor.start(configuration)
+            processState = await supervisor.state()
+            healthStatus = "Loading model…"
+            monitorTask?.cancel()
+            monitorTask = Task { [weak self] in
+                guard let self else { return }
+                let ready = await HealthProbe().waitUntilReady(
+                    url: configuration.healthURL,
+                    timeout: .seconds(600),
+                    interval: .milliseconds(500)
+                )
+                guard !Task.isCancelled else { return }
+                await MainActor.run {
+                    self.healthStatus =
+                        ready ? "Ready · http://127.0.0.1:\(port)" : "Startup timed out"
+                    self.processState =
+                        ready
+                        ? .running(processIdentifier: 0)
+                        : .failed(message: "Health check timed out")
+                }
+            }
+        } catch {
+            processState = .failed(message: error.localizedDescription)
+            healthStatus = "Failed"
+            lastError = error.localizedDescription
+        }
+    }
+
+    func stopEngine() async {
+        monitorTask?.cancel()
+        await supervisor.stop()
+        processState = await supervisor.state()
+        healthStatus = "Stopped"
+    }
+
+    func openAPI() {
+        guard let port = UInt16(portText), let url = URL(string: "http://127.0.0.1:\(port)/docs")
+        else {
+            return
+        }
+        #if os(macOS)
+            NSWorkspace.shared.open(url)
+        #endif
+    }
+
+    var selectedInstallation: RuntimeInstallation? {
+        guard let selectedInstallationID else { return nil }
+        return installations.first(where: { $0.id == selectedInstallationID })
+    }
+
+    var isEngineRunning: Bool {
+        if case .running = processState { return true }
+        if case .starting = processState { return true }
+        if case .stopping = processState { return true }
+        return false
+    }
+
     func dismissError() {
         lastError = nil
     }
@@ -134,5 +406,9 @@ final class DesktopViewModel: ObservableObject {
                 logEvents.removeFirst(logEvents.count - 2_000)
             }
         }
+    }
+
+    deinit {
+        monitorTask?.cancel()
     }
 }

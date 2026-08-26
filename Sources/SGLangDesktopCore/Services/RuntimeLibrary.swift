@@ -89,6 +89,12 @@ public actor RuntimeLibrary {
         }
         try await store.save(records)
     }
+
+    public func removeRegistration(id: UUID) async throws {
+        var records = try await store.load()
+        records.removeAll { $0.id == id }
+        try await store.save(records)
+    }
 }
 
 public enum RuntimeLibraryError: LocalizedError {

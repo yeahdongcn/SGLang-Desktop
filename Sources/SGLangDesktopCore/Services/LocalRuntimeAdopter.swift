@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct LocalRuntimeAdopter: Sendable {
@@ -6,7 +7,8 @@ public struct LocalRuntimeAdopter: Sendable {
     public func makeInstallation(
         executableURL: URL,
         engine: EngineKind? = nil,
-        displayName: String? = nil
+        displayName: String? = nil,
+        stableIdentity: String? = nil
     ) throws -> RuntimeInstallation {
         let executable = executableURL.standardizedFileURL
         guard FileManager.default.isExecutableFile(atPath: executable.path) else {
@@ -16,7 +18,7 @@ public struct LocalRuntimeAdopter: Sendable {
         let inferredEngine = try engine ?? inferEngine(from: executable.lastPathComponent)
         let root = executable.deletingLastPathComponent().deletingLastPathComponent()
         let relativeEntrypoint = try relativePath(of: executable, under: root)
-        let identifier = UUID().uuidString.lowercased()
+        let identifier = stableIdentity ?? UUID().uuidString.lowercased()
         let manifest = RuntimeManifest(
             id: "local-\(inferredEngine.rawValue)-\(identifier)",
             displayName: displayName ?? "Local \(inferredEngine.displayName)",
@@ -31,6 +33,11 @@ public struct LocalRuntimeAdopter: Sendable {
         )
         try manifest.validate()
         return RuntimeInstallation(manifest: manifest, rootDirectory: root)
+    }
+
+    public func stableIdentity(for executableURL: URL) -> String {
+        let digest = SHA256.hash(data: Data(executableURL.standardizedFileURL.path.utf8))
+        return digest.prefix(10).map { String(format: "%02x", $0) }.joined()
     }
 
     private func inferEngine(from executableName: String) throws -> EngineKind {

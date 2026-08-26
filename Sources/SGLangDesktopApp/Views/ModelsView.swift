@@ -29,5 +29,10 @@ struct ModelsView: View {
             }
         }
         .navigationTitle("Models")
+        .toolbar {
+            Text("HF / ModelScope cache autodiscovery")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
     }
 }

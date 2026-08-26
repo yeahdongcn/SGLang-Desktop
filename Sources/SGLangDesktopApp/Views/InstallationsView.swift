@@ -100,6 +100,11 @@ private struct RuntimeRow: View {
                     .font(.caption.monospaced())
                     .foregroundStyle(.tertiary)
                     .lineLimit(1)
+                if installation.manifest.channel == .local {
+                    Text("Local development runtime · dependencies are managed by your checkout")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                }
             }
 
             Spacer()

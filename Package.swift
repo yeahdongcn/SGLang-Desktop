@@ -19,7 +19,8 @@ let package = Package(
         .executableTarget(
             name: "SGLangDesktopApp",
             dependencies: ["SGLangDesktopCore"],
-            path: "Sources/SGLangDesktopApp"
+            path: "Sources/SGLangDesktopApp",
+            resources: [.process("Resources")]
         ),
         .testTarget(
             name: "SGLangDesktopCoreTests",

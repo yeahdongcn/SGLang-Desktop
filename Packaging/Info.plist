@@ -10,6 +10,8 @@
     <string>SGLangDesktop</string>
     <key>CFBundleIdentifier</key>
     <string>org.sglang.desktop</string>
+    <key>CFBundleIconFile</key>
+    <string>SGLangDesktop.icns</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>
