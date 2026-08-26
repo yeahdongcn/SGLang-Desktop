@@ -915,8 +915,6 @@ final class DesktopViewModel: ObservableObject {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(600))
         var becameReady = initiallyReady
-        var consecutiveHealthFailures = 0
-        var nextHealthProbe = clock.now
 
         while !Task.isCancelled {
             guard foregroundSession?.id == session.id else { return }
@@ -943,28 +941,21 @@ final class DesktopViewModel: ObservableObject {
                 break
             }
 
-            if clock.now >= nextHealthProbe {
+            // SGLang's /health may run a one-token generation when the engine
+            // is idle. Probe only until readiness is established; process
+            // liveness is monitored separately by the supervisor.
+            if !becameReady {
                 let isReady = await HealthProbe().isReady(url: session.healthURL)
                 guard !Task.isCancelled, foregroundSession?.id == session.id else { return }
                 if isReady {
                     becameReady = true
-                    consecutiveHealthFailures = 0
                     healthStatus = "Ready · http://127.0.0.1:\(session.port)"
-                } else if becameReady {
-                    consecutiveHealthFailures += 1
-                    if consecutiveHealthFailures >= 2 {
-                        healthStatus =
-                            "Running · API temporarily unavailable · 127.0.0.1:\(session.port)"
-                    }
                 } else if clock.now >= deadline {
                     healthStatus = "Startup timed out"
                     return
                 }
-                nextHealthProbe = clock.now.advanced(
-                    by: becameReady ? .seconds(3) : .milliseconds(500)
-                )
             }
-            try? await clock.sleep(for: .milliseconds(250))
+            try? await clock.sleep(for: becameReady ? .seconds(1) : .milliseconds(500))
         }
     }
 
