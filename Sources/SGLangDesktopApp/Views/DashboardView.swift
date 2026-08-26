@@ -5,33 +5,6 @@ struct DashboardView: View {
     @EnvironmentObject private var model: DesktopViewModel
     @State private var isChoosingModel = false
 
-    private let productCapabilities = [
-        (
-            "Multiple installations", "Independent SGLang and SGLang-Omni runtimes",
-            "square.stack.3d.up"
-        ),
-        (
-            "Apple-ready runtime", "Relocatable Python, PyTorch MPS, MLX, and media libraries",
-            "apple.logo"
-        ),
-        (
-            "One-click updates", "Versioned runtime updates without mutating a working install",
-            "arrow.triangle.2.circlepath"
-        ),
-        (
-            "Snapshots & rollback", "Return to the previous runtime when an update fails",
-            "clock.arrow.circlepath"
-        ),
-        (
-            "Model library", "Download, verify, reuse, and relocate model weights",
-            "externaldrive.badge.icloud"
-        ),
-        (
-            "Built-in diagnostics", "Health checks, logs, and actionable startup failures",
-            "stethoscope"
-        ),
-    ]
-
     var body: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 24) {
@@ -83,34 +56,6 @@ struct DashboardView: View {
                 }
 
                 EngineControlCard(isChoosingModel: $isChoosingModel)
-
-                VStack(alignment: .leading, spacing: 14) {
-                    Text("Product scope")
-                        .font(.title2.bold())
-
-                    LazyVGrid(
-                        columns: [GridItem(.adaptive(minimum: 300), spacing: 12)], spacing: 12
-                    ) {
-                        ForEach(productCapabilities, id: \.0) { capability in
-                            HStack(alignment: .top, spacing: 12) {
-                                Image(systemName: capability.2)
-                                    .font(.title2)
-                                    .foregroundStyle(.tint)
-                                    .frame(width: 30)
-                                VStack(alignment: .leading, spacing: 3) {
-                                    Text(capability.0).font(.headline)
-                                    Text(capability.1)
-                                        .font(.subheadline)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Spacer()
-                            }
-                            .padding(14)
-                            .background(
-                                .background.secondary, in: RoundedRectangle(cornerRadius: 12))
-                        }
-                    }
-                }
             }
             .padding(28)
         }

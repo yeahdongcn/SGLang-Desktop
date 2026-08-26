@@ -11,12 +11,25 @@ import Testing
     let snapshot = modelRoot.appending(path: "snapshots/abc123")
     try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
     try Data("{}".utf8).write(to: snapshot.appending(path: "config.json"))
+    try Data("weights".utf8).write(to: snapshot.appending(path: "model.safetensors"))
 
     let discovered = ModelCacheDiscovery().discover(
         homeDirectory: root,
         additionalRoots: [root]
     )
     #expect(discovered.contains(where: { $0.repository == "mlx-community/Qwen3-ASR-0.6B-4bit" }))
+}
+
+@Test func ignoresIncompleteCacheWithoutWeights() throws {
+    let root = FileManager.default.temporaryDirectory
+        .appending(path: "sglang-incomplete-cache-\(UUID().uuidString)")
+    defer { try? FileManager.default.removeItem(at: root) }
+    let snapshot = root.appending(path: "models--Qwen--Qwen3-0.6B/snapshots/partial")
+    try FileManager.default.createDirectory(at: snapshot, withIntermediateDirectories: true)
+    try Data("{}".utf8).write(to: snapshot.appending(path: "config.json"))
+
+    let discovered = ModelCacheDiscovery().discover(homeDirectory: root, additionalRoots: [root])
+    #expect(discovered.isEmpty)
 }
 
 @Test func discoversRuntimeExecutablesInAppleVenvLayout() throws {

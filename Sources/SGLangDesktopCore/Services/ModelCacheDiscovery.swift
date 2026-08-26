@@ -27,6 +27,7 @@ public struct ModelCacheDiscovery: Sendable {
             else { continue }
             for child in children where child.lastPathComponent.hasPrefix("models--") {
                 guard let snapshot = latestSnapshot(in: child) else { continue }
+                guard hasModelWeights(snapshot) else { continue }
                 let repository = repositoryName(from: child.lastPathComponent)
                 let key = repository.lowercased()
                 let engineSet: Set<EngineKind> =
@@ -68,6 +69,24 @@ public struct ModelCacheDiscovery: Sendable {
     private func repositoryName(from cacheName: String) -> String {
         let parts = cacheName.dropFirst("models--".count).split(separator: "--", maxSplits: 1)
         return parts.map(String.init).joined(separator: "/")
+    }
+
+    private func hasModelWeights(_ snapshot: URL) -> Bool {
+        guard
+            let entries = try? FileManager.default.contentsOfDirectory(
+                at: snapshot,
+                includingPropertiesForKeys: [.isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            )
+        else { return false }
+        return entries.contains { entry in
+            let name = entry.lastPathComponent.lowercased()
+            return name.hasSuffix(".safetensors")
+                || name == "model.safetensors.index.json"
+                || name.hasSuffix(".bin")
+                || name.hasSuffix(".gguf")
+                || name.hasSuffix(".mlx")
+        }
     }
 
 }
