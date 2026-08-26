@@ -1,0 +1,30 @@
+{
+  "architecture" : "arm64",
+  "artifactKind" : "complete",
+  "capabilities" : [
+    "openai-api",
+    "qwen3-asr",
+    "mlx",
+    "torch-mps"
+  ],
+  "components" : {
+    "ffmpeg" : "7.1.5",
+    "python" : "3.12.12",
+    "pythonBuildStandalone" : "20260211",
+    "sglang" : "v0.5.16",
+    "torch" : "2.11.0"
+  },
+  "channel" : "stable",
+  "containsNativeCode" : true,
+  "defaultArguments" : [
+    "serve"
+  ],
+  "displayName" : "SGLang-Omni Apple Runtime",
+  "engine" : "sglang-omni",
+  "entrypoint" : "bin/sgl-omni",
+  "id" : "sglang-omni-apple-stable",
+  "minimumMacOSVersion" : "14.0",
+  "platform" : "macos",
+  "schemaVersion" : 1,
+  "version" : "0.1.0-apple.1"
+}

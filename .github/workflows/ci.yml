@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  apple-silicon:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_16.2.app
+      - name: Format, build, and test
+        run: ./scripts/check.sh
+      - name: Build local app bundle
+        run: ./scripts/build-app.sh
